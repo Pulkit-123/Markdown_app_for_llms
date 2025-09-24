@@ -1,126 +1,284 @@
 """
-Universal File → Markdown Converter (Drag, Drop, Download)
-----------------------------------------------------------
-A super-simple Streamlit app that:
-  [1] takes file uploads as user input
-  [2] converts them to Markdown via `markitdown`
-  [3] shows a 1,000-char preview
-  [4] provides a download button for the full .md file
+Docs to Markdown Converter — Streamlit (Refined)
+------------------------------------------------
+Features:
+- Drag & drop files (PDF, PPTX, DOCX, XLSX, JPG, JPEG, PNG, MP3)
+- Convert to Markdown via `markitdown`
+- 1,000-char preview + rendered Markdown in an expander
+- Per-file Download (.md); optional plain-text (.txt)
+- "Download All" as a ZIP (Markdown and optional TXT)
+- Large-file warning + chunked save with progress bar
+- SHA-256 dedupe & cache to avoid re-processing in-session
+- Robust error & edge-case handling, sanitized filenames
 
-UI: Drag, drop, download. Nothing more.
-
-How it works (structure):
-- save_upload(): writes an in-memory upload to a temporary path
-- convert_with_markitdown(): returns Markdown text from a file path
-- build_output_name(): generates a clean output filename (original + timestamp)
-- Streamlit layout: uploader → per-file preview → per-file download
+Notes:
+- This app intentionally keeps the UI minimal; all refinements are under-the-hood or small quality-of-life improvements.
 """
 
 import io
 import os
+import re
+import zipfile
+import hashlib
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, Tuple, Optional
 
 import streamlit as st
 from markitdown import MarkItDown
 
+# --------------------------
+# Config
+# --------------------------
+ACCEPTED_EXTS = {".pdf", ".pptx", ".docx", ".xlsx", ".jpg", ".jpeg", ".png", ".mp3"}
+CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB
+WARN_MB = 50                  # warn users beyond this
+HARD_CAP_MB = 200             # reject beyond this
+PREVIEW_CHARS = 1000
+
+st.set_page_config(
+    page_title="Docs to Markdown Converter",
+    page_icon="📝",
+    layout="centered",
+)
+
+st.title("Docs to Markdown Converter")
+st.caption("Drag & drop your files. We’ll convert to Markdown, show a preview, and let you download the result.")
 
 # --------------------------
-# Helpers
+# Session State
 # --------------------------
-def save_upload(upload) -> str:
-    """
-    Persist the uploaded file-like object to a temporary path.
-    Returns:
-        str: Absolute file path on disk suitable for markitdown.
-    """
-    suffix = Path(upload.name).suffix or ""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(upload.read())
-        return tmp.name  # caller responsible for cleanup
+if "results" not in st.session_state:
+    # results: dict[sha256] -> {"name": orig_name, "md": str, "txt": Optional[str], "ts": str}
+    st.session_state.results = {}
 
+# --------------------------
+# Utilities
+# --------------------------
+def sanitize_filename(name: str) -> str:
+    """Sanitize filenames for downloads (keep it readable)."""
+    name = name.strip().replace(" ", "_")
+    # keep letters, digits, dash, underscore, dot
+    name = re.sub(r"[^A-Za-z0-9._-]", "", name)
+    return name or "file"
 
-def convert_with_markitdown(src_path: str) -> str:
-    """
-    Convert a file at `src_path` to Markdown using markitdown.
-    Returns:
-        str: Markdown content (empty string if none).
-    """
-    md = MarkItDown()
-    result = md.convert(src_path)
-    return (result.text_content or "").strip()
-
-
-def build_output_name(input_name: str) -> str:
-    """
-    Create a deterministic output filename for the Markdown export.
-    Example: 'report.docx' -> 'report__20250101-120000.md'
-    """
+def build_output_name(input_name: str, ext: str = ".md") -> str:
+    """Create an output filename like 'report__20250101-120000.md'."""
     base = Path(input_name).stem or "converted"
+    base = sanitize_filename(base)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return f"{base}__{stamp}.md"
+    return f"{base}__{stamp}{ext}"
 
+def strip_markdown(md: str) -> str:
+    """Very light Markdown → plain-text (keeps links text)."""
+    # remove code fences/inline backticks
+    text = re.sub(r"`{1,3}[^`]*`{1,3}", "", md)
+    # remove headings/list markers/blockquote
+    text = re.sub(r"^\s{0,3}(#+|\*|-|\+|>)\s*", "", text, flags=re.MULTILINE)
+    # remove images, keep alt text
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    # links → just link text
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # remaining markup artifacts
+    text = re.sub(r"[*_>#~`]", "", text)
+    # collapse extra spaces
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
+
+def is_supported(filename: str) -> bool:
+    return Path(filename).suffix.lower() in ACCEPTED_EXTS
+
+def human_mb(num_bytes: int) -> float:
+    return num_bytes / (1024 * 1024)
+
+def sha256_stream_and_save(uploaded_file, suffix: str) -> Tuple[str, str, int]:
+    """
+    Stream an UploadedFile to a temp file while computing SHA-256.
+    Returns:
+        (temp_path, sha256_hex, size_bytes)
+    """
+    # Try to get total size (Streamlit UploadedFile usually has .size)
+    total_size = getattr(uploaded_file, "size", None)
+    if total_size and human_mb(total_size) > HARD_CAP_MB:
+        raise ValueError(f"File exceeds hard size cap of {HARD_CAP_MB} MB.")
+
+    h = hashlib.sha256()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp_path = tmp.name
+
+    # reset pointer (safely)
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+
+    bytes_written = 0
+    progress = st.progress(0, text="Saving upload…")
+    while True:
+        chunk = uploaded_file.read(CHUNK_SIZE)
+        if not chunk:
+            break
+        tmp.write(chunk)
+        h.update(chunk)
+        bytes_written += len(chunk)
+        if total_size:
+            progress.progress(min(bytes_written / total_size, 1.0), text="Saving upload…")
+
+        # Mid-stream hard cap (if .size missing initially)
+        if bytes_written and human_mb(bytes_written) > HARD_CAP_MB:
+            tmp.close()
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            progress.empty()
+            raise ValueError(f"File exceeds hard size cap of {HARD_CAP_MB} MB.")
+
+    tmp.close()
+    progress.empty()
+    return tmp_path, h.hexdigest(), bytes_written
+
+@st.cache_data(show_spinner=False)
+def convert_via_markitdown(temp_path: str) -> str:
+    """Cacheable conversion step — deterministic on file content path."""
+    md = MarkItDown()
+    res = md.convert(temp_path)
+    return (res.text_content or "").strip()
 
 # --------------------------
-# Streamlit App
+# Sidebar (lightweight options)
 # --------------------------
-st.set_page_config(page_title="File → Markdown", page_icon="📝", layout="centered")
+with st.sidebar:
+    st.subheader("Options")
+    also_plain_text = st.checkbox("Also export plain-text (.txt)", value=False)
+    allow_zip_all = st.checkbox("Enable 'Download All as ZIP'", value=True)
+    st.caption("Files over 50 MB show a warning; files over 200 MB are blocked.")
 
-st.markdown("## 📝 File → Markdown (Drag, Drop, Download)")
-st.caption("Drop DOCX, PPTX, XLSX, PDF, HTML, ZIP, etc. We'll convert them to Markdown and let you download.")
-
+# --------------------------
+# Uploader
+# --------------------------
 uploads = st.file_uploader(
     "Drop files here (or click to browse)",
-    type=None,               # accept any; markitdown routes by extension
+    type=[ext.lstrip(".") for ext in ACCEPTED_EXTS],
     accept_multiple_files=True,
     label_visibility="collapsed",
 )
 
-if uploads:
-    st.divider()
-    st.markdown("### Results")
+if not uploads:
+    with st.container(border=True):
+        st.write("Drag & drop supported files above: **PDF, PPTX, DOCX, XLSX, JPG, JPEG, PNG, MP3**.")
+    st.stop()
 
-    for upload in uploads:
-        with st.container(border=True):
-            st.markdown(f"**File:** {upload.name}")
+st.divider()
+st.subheader("Results")
 
-            # 1) Save to temp file
-            temp_path = save_upload(upload)
+# --------------------------
+# Process each file
+# --------------------------
+for upload in uploads:
+    with st.container(border=True):
+        st.markdown(f"**File:** {upload.name}")
 
-            # 2) Convert with markitdown
+        # Validate extension
+        if not is_supported(upload.name):
+            st.error("Unsupported file type. Please upload one of: PDF, PPTX, DOCX, XLSX, JPG, JPEG, PNG, MP3.")
+            continue
+
+        # Size warnings
+        size_bytes = getattr(upload, "size", None)
+        if size_bytes is not None:
+            size_mb = human_mb(size_bytes)
+            if size_mb > WARN_MB and size_mb <= HARD_CAP_MB:
+                st.warning(f"This file is **{size_mb:.1f} MB**. Conversion may take longer.")
+
+        # Save + hash
+        suffix = Path(upload.name).suffix or ""
+        try:
+            temp_path, file_hash, saved_bytes = sha256_stream_and_save(upload, suffix)
+        except Exception as e:
+            st.error(f"Upload failed: {e}")
+            continue
+
+        # Dedupe check
+        if file_hash in st.session_state.results:
+            st.info("Already converted in this session. Using cached result.")
+            md_text = st.session_state.results[file_hash]["md"]
+            txt_text = st.session_state.results[file_hash].get("txt")
+        else:
+            # Convert
             try:
-                md_text = convert_with_markitdown(temp_path)
+                with st.spinner("Converting…"):
+                    md_text = convert_via_markitdown(temp_path)
             except Exception as e:
                 st.error(f"Conversion failed: {e}")
                 md_text = ""
             finally:
-                # Cleanup temp file
                 try:
                     os.remove(temp_path)
                 except OSError:
                     pass
 
-            # 3) Preview (first 1000 chars)
-            preview = md_text[:1000]
-            if preview:
-                st.markdown("**Preview (first 1000 characters):**")
-                st.code(preview, language="markdown")
-            else:
-                st.info("No text extracted or empty document.")
+            txt_text = strip_markdown(md_text) if also_plain_text and md_text else None
+            st.session_state.results[file_hash] = {
+                "name": upload.name,
+                "md": md_text,
+                "txt": txt_text,
+                "ts": datetime.now().isoformat(timespec="seconds"),
+            }
 
-            # 4) Download button for full Markdown
-            out_name = build_output_name(upload.name)
+        # Preview
+        preview = (md_text or "")[:PREVIEW_CHARS]
+        if preview:
+            st.markdown("**Preview (first 1,000 characters):**")
+            st.code(preview, language="markdown")
+        else:
+            st.info("No text extracted or the document is empty.")
+
+        # Downloads
+        out_md_name = build_output_name(upload.name, ".md")
+        st.download_button(
+            label=f"⬇️ Download {out_md_name}",
+            data=(md_text or "").encode("utf-8"),
+            file_name=out_md_name,
+            mime="text/markdown",
+            use_container_width=True,
+        )
+        if also_plain_text and md_text:
+            out_txt_name = build_output_name(upload.name, ".txt")
             st.download_button(
-                label=f"⬇️ Download {out_name}",
-                data=md_text.encode("utf-8"),
-                file_name=out_name,
-                mime="text/markdown",
+                label=f"⬇️ Download {out_txt_name}",
+                data=(st.session_state.results[file_hash]["txt"] or "").encode("utf-8"),
+                file_name=out_txt_name,
+                mime="text/plain",
                 use_container_width=True,
             )
 
-else:
-    # Simple, distraction-free landing state
-    with st.container(border=True):
-        st.write("Drag & drop files above to convert them to Markdown. That’s it. 🙂")
+        # Rendered expander
+        with st.expander("Rendered Preview"):
+            st.markdown(md_text or "_(Nothing to render)_")
+
+# --------------------------
+# Bundle: Download all as ZIP
+# --------------------------
+if allow_zip_all and st.session_state.results:
+    st.divider()
+    if st.button("⬇️ Download ALL as ZIP", use_container_width=True):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for h, item in st.session_state.results.items():
+                base_name = sanitize_filename(Path(item["name"]).stem)
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                md_name = f"{base_name}__{ts}.md"
+                zf.writestr(md_name, item["md"] or "")
+                if also_plain_text and item.get("txt"):
+                    txt_name = f"{base_name}__{ts}.txt"
+                    zf.writestr(txt_name, item["txt"] or "")
+        buf.seek(0)
+        st.download_button(
+            label="⬇️ Save ZIP",
+            data=buf,
+            file_name=f"converted_markdown_{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
